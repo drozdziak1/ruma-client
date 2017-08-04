@@ -30,9 +30,12 @@ optional = true
 version = "0.1.4"
 
 [dev-dependencies]
-futures-await = { git = 'https://github.com/alexcrichton/futures-await' }
+futures-await = "0.1.1"
 ruma-events = "0.9.0"
 
 [features]
 default = ["tls"]
 tls = ["hyper-tls", "native-tls"]
+
+[patch.crates-io]
+ruma-client-api = { git = "https://github.com/ruma/ruma-client-api" }
