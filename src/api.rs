@@ -33,7 +33,7 @@ macro_rules! endpoint {
 
             /// Make a request to this API endpoint.
             pub fn call<C>(
-                client: Client<C>,
+                client: &Client<C>,
                 request: Request,
             ) -> impl Future<Item = Response, Error = Error>
             where

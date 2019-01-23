@@ -4,7 +4,13 @@
 #![deny(missing_docs)]
 #![feature(try_from)]
 
-use std::{convert::TryInto, str::FromStr, sync::{Arc, Mutex}};
+/// Matrix client-server API endpoints.
+pub mod api;
+
+mod error;
+mod session;
+
+use std::{convert::TryInto, str::FromStr};
 
 use futures::{
     future::{Future, FutureFrom, IntoFuture},
@@ -19,52 +25,47 @@ use hyper_tls::HttpsConnector;
 #[cfg(feature = "hyper-tls")]
 use native_tls::Error as NativeTlsError;
 use ruma_api::Endpoint;
+use tokio::runtime::current_thread;
 use url::Url;
+
+use crate::api::r0::session::login;
 
 pub use crate::{error::Error, session::Session};
 
-/// Matrix client-server API endpoints.
-pub mod api;
-mod error;
-mod session;
-
 /// A client for the Matrix client-server API.
 #[derive(Debug)]
-pub struct Client<C: Connect>(Arc<ClientData<C>>);
-
-/// Data contained in Client's Rc
-#[derive(Debug)]
-pub struct ClientData<C>
+pub struct Client<C>
 where
     C: Connect,
 {
-    homeserver_url: Url,
     hyper: HyperClient<C>,
-    session: Mutex<Option<Session>>,
+    homeserver_url: Url,
+    /// The current Matrix session credentials
+    pub session: Option<Session>,
 }
 
 impl Client<HttpConnector> {
     /// Creates a new client for making HTTP requests to the given homeserver.
-    pub fn new(homeserver_url: Url, session: Option<Session>) -> Self {
-        Client(Arc::new(ClientData {
+    pub fn new(homeserver_url: Url) -> Self {
+        Client {
             homeserver_url,
-            hyper: HyperClient::builder().keep_alive(true).build_http(),
-            session: Mutex::new(session),
-        }))
+            hyper: HyperClient::builder().keep_alive(false).build_http(),
+            session: None,
+        }
     }
 }
 
 #[cfg(feature = "tls")]
 impl Client<HttpsConnector<HttpConnector>> {
     /// Creates a new client for making HTTPS requests to the given homeserver.
-    pub fn https(homeserver_url: Url, session: Option<Session>) -> Result<Self, NativeTlsError> {
+    pub fn new_https(homeserver_url: Url) -> Result<Self, NativeTlsError> {
         let connector = HttpsConnector::new(4)?;
 
-        Ok(Client(Arc::new(ClientData {
+        Ok(Client {
             homeserver_url,
-            hyper: { HyperClient::builder().keep_alive(true).build(connector) },
-            session: Mutex::new(session),
-        })))
+            hyper: { HyperClient::builder().keep_alive(false).build(connector) },
+            session: None,
+        })
     }
 }
 
@@ -75,16 +76,12 @@ where
     /// Creates a new client using the given `hyper::Client`.
     ///
     /// This allows the user to configure the details of HTTP as desired.
-    pub fn custom(
-        hyper_client: HyperClient<C>,
-        homeserver_url: Url,
-        session: Option<Session>,
-    ) -> Self {
-        Client(Arc::new(ClientData {
+    pub fn new_custom(hyper_client: HyperClient<C>, homeserver_url: Url) -> Self {
+        Self {
             homeserver_url,
             hyper: hyper_client,
-            session: Mutex::new(session),
-        }))
+            session: None,
+        }
     }
 
     /// Log in with a username and password.
@@ -92,45 +89,44 @@ where
     /// In contrast to api::r0::session::login::call(), this method stores the
     /// session data returned by the endpoint in this client, instead of
     /// returning it.
-    pub fn log_in(
-        &self,
-        user: String,
+    pub fn log_in<'a>(
+        &'a mut self,
+        user: &str,
         password: String,
         device_id: Option<String>,
-    ) -> impl Future<Item = Session, Error = Error> {
-        use crate::api::r0::session::login;
-
-        let data = self.0.clone();
-
-        login::call(
-            self.clone(),
+    ) -> Result<&'a mut Self, Error> {
+        let fut = login::call(
+            self,
             login::Request {
                 address: None,
                 login_type: login::LoginType::Password,
                 medium: None,
                 device_id,
                 password,
-                user,
+                user: user.to_owned(),
             },
         )
-        .map(move |response| {
-            let session = Session::new(response.access_token, response.user_id, response.device_id);
-            *data.session.lock().unwrap() = Some(session.clone());
+        .map(|response| {
+            Some(Session {
+                access_token: response.access_token,
+                user_id: response.user_id,
+                device_id: response.device_id,
+            })
+        });
 
-            session
-        })
+        self.session = current_thread::block_on_all(fut)?;
+
+        Ok(self)
     }
 
     /// Register as a guest. In contrast to api::r0::account::register::call(),
     /// this method stores the session data returned by the endpoint in this
     /// client, instead of returning it.
-    pub fn register_guest(&self) -> impl Future<Item = Session, Error = Error> {
+    pub fn register_guest<'a>(&'a mut self) -> Result<&'a mut Self, Error> {
         use crate::api::r0::account::register;
 
-        let data = self.0.clone();
-
-        register::call(
-            self.clone(),
+        let fut = register::call(
+            self,
             register::Request {
                 auth: None,
                 bind_email: None,
@@ -141,12 +137,17 @@ where
                 username: None,
             },
         )
-        .map(move |response| {
-            let session = Session::new(response.access_token, response.user_id, response.device_id);
-            *data.session.lock().unwrap() = Some(session.clone());
+        .map(|response| {
+            Some(Session {
+                access_token: response.access_token,
+                user_id: response.user_id,
+                device_id: response.device_id,
+            })
+        });
 
-            session
-        })
+        self.session = current_thread::block_on_all(fut)?;
+
+        Ok(self)
     }
 
     /// Register as a new user on this server.
@@ -157,17 +158,15 @@ where
     ///
     /// The username is the local part of the returned user_id. If it is
     /// omitted from this request, the server will generate one.
-    pub fn register_user(
-        &self,
+    pub fn register_user<'a>(
+        &'a mut self,
         username: Option<String>,
         password: String,
-    ) -> impl Future<Item = Session, Error = Error> {
+    ) -> Result<&'a mut Self, Error> {
         use crate::api::r0::account::register;
 
-        let data = self.0.clone();
-
-        register::call(
-            self.clone(),
+        let fut = register::call(
+            self,
             register::Request {
                 auth: None,
                 bind_email: None,
@@ -178,12 +177,17 @@ where
                 username,
             },
         )
-        .map(move |response| {
-            let session = Session::new(response.access_token, response.user_id, response.device_id);
-            *data.session.lock().unwrap() = Some(session.clone());
+        .map(|response| {
+            Some(Session {
+                access_token: response.access_token,
+                user_id: response.user_id,
+                device_id: response.device_id,
+            })
+        });
 
-            session
-        })
+        self.session = current_thread::block_on_all(fut)?;
+
+        Ok(self)
     }
 
     /// Convenience method that represents repeated calls to the sync_events endpoint as a stream.
@@ -196,10 +200,9 @@ where
         filter: Option<api::r0::sync::sync_events::Filter>,
         since: Option<String>,
         set_presence: bool,
-    ) -> impl Stream<Item = api::r0::sync::sync_events::Response, Error = Error> {
+    ) -> impl Stream<Item = api::r0::sync::sync_events::Response, Error = Error> + '_ {
         use crate::api::r0::sync::sync_events;
 
-        let client = self.clone();
         let set_presence = if set_presence {
             None
         } else {
@@ -207,9 +210,10 @@ where
         };
 
         stream::unfold(since, move |since| {
+            let client = self.clone();
             Some(
                 sync_events::call(
-                    client.clone(),
+                    &client.clone(),
                     sync_events::Request {
                         filter: filter.clone(),
                         since,
@@ -228,15 +232,15 @@ where
 
     /// Makes a request to a Matrix API endpoint.
     pub(crate) fn request<E>(
-        self,
+        &self,
         request: <E as Endpoint>::Request,
     ) -> impl Future<Item = E::Response, Error = Error>
     where
         E: Endpoint,
     {
-        let data1 = self.0.clone();
-        let data2 = self.0.clone();
-        let mut url = self.0.homeserver_url.clone();
+        let session_opt = self.session.clone();
+        let mut url = self.homeserver_url.clone();
+        let hyper_client = self.hyper.clone();
 
         request
             .try_into()
@@ -250,9 +254,9 @@ where
                     url.set_query(uri.query());
 
                     if E::METADATA.requires_authentication {
-                        if let Some(ref session) = *data1.session.lock().unwrap() {
+                        if let Some(session) = session_opt {
                             url.query_pairs_mut()
-                                .append_pair("access_token", session.access_token());
+                                .append_pair("access_token", &session.access_token.clone());
                         } else {
                             return Err(Error::AuthenticationRequired);
                         }
@@ -266,16 +270,10 @@ where
             .and_then(move |(uri, mut hyper_request)| {
                 *hyper_request.uri_mut() = uri;
 
-                data2.hyper.request(hyper_request).map_err(Error::from)
+                hyper_client.request(hyper_request).map_err(Error::from)
             })
             .and_then(|hyper_response| {
                 E::Response::future_from(hyper_response).map_err(Error::from)
             })
-    }
-}
-
-impl<C: Connect> Clone for Client<C> {
-    fn clone(&self) -> Client<C> {
-        Client(self.0.clone())
     }
 }
